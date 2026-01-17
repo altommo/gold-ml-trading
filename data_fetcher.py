@@ -360,6 +360,7 @@ def fetch_gold_data(
     Convenience function to fetch gold (XAUUSD) data with caching
 
     Historical data is always preserved. New fetches only ADD recent candles.
+    Tries multiple exchanges if one fails.
 
     Args:
         source: Data source ('tradingview', 'yahoo', 'csv')
@@ -374,12 +375,19 @@ def fetch_gold_data(
         DataFrame with OHLCV data
     """
     symbol = 'XAUUSD'
-    exchange = 'OANDA' if source == 'tradingview' else 'YAHOO'
 
-    # Load existing cache (historical data never expires)
+    # Exchanges to try in order of preference
+    exchanges = ['OANDA', 'FOREXCOM', 'FX', 'FXCM']
+
+    # Try to load from any existing cache first
     cached = None
+    used_exchange = None
     if use_cache and source != 'csv':
-        cached = load_from_cache(symbol, exchange, interval, max_age_hours=None)
+        for exchange in exchanges:
+            cached = load_from_cache(symbol, exchange, interval, max_age_hours=None)
+            if cached is not None:
+                used_exchange = exchange
+                break
 
     # If we have cache and don't need latest, return it
     if cached is not None and not fetch_latest:
@@ -387,14 +395,34 @@ def fetch_gold_data(
 
     # Fetch new data
     if source == 'tradingview':
-        df = fetch_from_tradingview(
-            symbol='XAUUSD',
-            exchange='OANDA',
-            interval=interval,
-            n_bars=n_bars,
-            **kwargs
-        )
+        df = None
+        fetch_exchange = None
+
+        # Try each exchange until one works
+        for exchange in exchanges:
+            try:
+                df = fetch_from_tradingview(
+                    symbol='XAUUSD',
+                    exchange=exchange,
+                    interval=interval,
+                    n_bars=n_bars,
+                    **kwargs
+                )
+                if df is not None and not df.empty:
+                    fetch_exchange = exchange
+                    break
+            except Exception as e:
+                print(f"  {exchange} failed: {e}")
+                continue
+
+        if df is None or df.empty:
+            raise ValueError(f"Could not fetch {symbol} data from any exchange")
+
+        # Use the exchange that worked for caching
+        used_exchange = fetch_exchange
+
     elif source == 'yahoo':
+        used_exchange = 'YAHOO'
         period = '60d' if interval in ['1h', '1m', '5m', '15m', '30m'] else '5y'
         df = fetch_from_yahoo(
             symbol='GC=F',
@@ -414,7 +442,7 @@ def fetch_gold_data(
         print(f"Merged with cache: now {len(df)} total bars")
 
     # Save combined data
-    save_to_cache(df, symbol, exchange, interval)
+    save_to_cache(df, symbol, used_exchange, interval)
 
     return df
 
