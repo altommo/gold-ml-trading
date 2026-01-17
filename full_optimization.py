@@ -3,6 +3,7 @@ Full Multi-Timeframe Optimization
 
 Tests all parameter combinations across multiple timeframes.
 Each timeframe has its own cached data that grows over time.
+Results are saved with timestamps for comparison between runs.
 """
 
 import pandas as pd
@@ -36,6 +37,9 @@ PARAM_RANGES = {
 
 # Results directory
 RESULTS_DIR = Path('./optimization_results')
+
+# Master results file (accumulates all runs)
+MASTER_RESULTS_FILE = RESULTS_DIR / 'all_optimization_runs.csv'
 
 
 def fetch_timeframe_data(interval: str, fetch_latest: bool = True) -> Optional[pd.DataFrame]:
@@ -81,7 +85,9 @@ def calculate_score(result: BacktestResult, min_trades: int = 15) -> float:
 def run_single_test(
     df: pd.DataFrame,
     params: Dict,
-    timeframe: str
+    timeframe: str,
+    data_start: str,
+    data_end: str
 ) -> Optional[Dict]:
     """Run a single parameter combination test"""
     try:
@@ -102,17 +108,27 @@ def run_single_test(
 
         score = calculate_score(result)
 
+        # Return with clear parameter names
         return {
             'timeframe': timeframe,
-            **params,
-            'return_pct': result.total_return_pct,
+            'sampling_period': params['range_filter.sampling_period'],
+            'range_multiplier': params['range_filter.range_multiplier'],
+            'stop_loss_pct': params['risk.stop_loss_value'],
+            'take_profit_pct': params['risk.take_profit_value'],
+            'min_bars_between': params['confirmation.min_bars_between_trades'],
+            'return_pct': round(result.total_return_pct, 2),
             'trades': result.total_trades,
-            'win_rate': result.win_rate,
-            'profit_factor': result.profit_factor,
-            'max_dd': result.max_drawdown_pct,
-            'sharpe': result.sharpe_ratio,
-            'expectancy_r': result.expectancy_r,
-            'score': score
+            'win_rate': round(result.win_rate, 1),
+            'profit_factor': round(result.profit_factor, 2),
+            'max_drawdown_pct': round(result.max_drawdown_pct, 2),
+            'sharpe_ratio': round(result.sharpe_ratio, 2),
+            'expectancy_r': round(result.expectancy_r, 3),
+            'max_concurrent_pos': result.max_concurrent_positions,
+            'avg_bars_held': round(result.avg_bars_held, 1),
+            'score': round(score, 2),
+            'data_start': data_start,
+            'data_end': data_end,
+            'data_bars': len(df)
         }
     except Exception as e:
         return None
@@ -147,7 +163,9 @@ def optimize_timeframe(
         print(f"Insufficient data for {interval}")
         return pd.DataFrame()
 
-    print(f"Data: {len(df)} bars from {df.index[0]} to {df.index[-1]}")
+    data_start = str(df.index[0])[:10]
+    data_end = str(df.index[-1])[:10]
+    print(f"Data: {len(df)} bars from {data_start} to {data_end}")
 
     # Generate combinations
     param_names = list(param_ranges.keys())
@@ -160,12 +178,12 @@ def optimize_timeframe(
     results = []
     for i, combo in enumerate(combinations):
         params = dict(zip(param_names, combo))
-        result = run_single_test(df, params, interval)
+        result = run_single_test(df, params, interval, data_start, data_end)
 
         if result is not None:
             results.append(result)
 
-        if verbose and (i + 1) % 50 == 0:
+        if verbose and (i + 1) % 100 == 0:
             print(f"  Progress: {i+1}/{total} ({(i+1)/total*100:.1f}%)")
 
     results_df = pd.DataFrame(results)
@@ -196,11 +214,17 @@ def optimize_all_timeframes(
 
     RESULTS_DIR.mkdir(exist_ok=True)
 
+    # Generate run timestamp
+    run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = RESULTS_DIR / f"run_{run_timestamp}"
+    run_dir.mkdir(exist_ok=True)
+
     all_results = {}
     best_per_tf = []
 
     print("="*70)
     print("FULL MULTI-TIMEFRAME OPTIMIZATION")
+    print(f"Run ID: {run_timestamp}")
     print("="*70)
     print(f"Timeframes: {timeframes}")
     print(f"Parameters: {list(PARAM_RANGES.keys())}")
@@ -216,72 +240,92 @@ def optimize_all_timeframes(
         all_results[tf] = results_df
 
         if not results_df.empty:
+            # Add run metadata
+            results_df['run_id'] = run_timestamp
+
             # Save individual timeframe results
             if save_results:
-                filepath = RESULTS_DIR / f"optimization_{tf}.csv"
+                filepath = run_dir / f"optimization_{tf}.csv"
                 results_df.to_csv(filepath, index=False)
                 print(f"Results saved to: {filepath}")
 
             # Track best for this timeframe
             best = results_df.iloc[0]
             best_per_tf.append({
+                'run_id': run_timestamp,
                 'timeframe': tf,
-                'sampling_period': best['range_filter.sampling_period'],
-                'range_mult': best['range_filter.range_multiplier'],
-                'stop_loss': best['risk.stop_loss_value'],
-                'take_profit': best['risk.take_profit_value'],
-                'min_bars': best['confirmation.min_bars_between_trades'],
+                'sampling_period': best['sampling_period'],
+                'range_multiplier': best['range_multiplier'],
+                'stop_loss_pct': best['stop_loss_pct'],
+                'take_profit_pct': best['take_profit_pct'],
+                'min_bars_between': best['min_bars_between'],
                 'return_pct': best['return_pct'],
                 'win_rate': best['win_rate'],
                 'profit_factor': best['profit_factor'],
-                'sharpe': best['sharpe'],
+                'sharpe_ratio': best['sharpe_ratio'],
+                'max_drawdown_pct': best['max_drawdown_pct'],
                 'trades': best['trades'],
-                'score': best['score']
+                'max_concurrent_pos': best['max_concurrent_pos'],
+                'score': best['score'],
+                'data_start': best['data_start'],
+                'data_end': best['data_end'],
+                'data_bars': best['data_bars']
             })
 
-    # Save summary
+    # Save run summary
     if save_results and best_per_tf:
         summary_df = pd.DataFrame(best_per_tf)
-        summary_path = RESULTS_DIR / "best_per_timeframe.csv"
+
+        # Save to run directory
+        summary_path = run_dir / "best_per_timeframe.csv"
         summary_df.to_csv(summary_path, index=False)
-        print(f"\nSummary saved to: {summary_path}")
+        print(f"\nRun summary saved to: {summary_path}")
+
+        # Append to master results file for comparison across runs
+        if MASTER_RESULTS_FILE.exists():
+            master_df = pd.read_csv(MASTER_RESULTS_FILE)
+            master_df = pd.concat([master_df, summary_df], ignore_index=True)
+        else:
+            master_df = summary_df
+        master_df.to_csv(MASTER_RESULTS_FILE, index=False)
+        print(f"Master results updated: {MASTER_RESULTS_FILE}")
+
+    print(f"\nAll results saved to: {run_dir}")
 
     return all_results
 
 
 def print_best_results(all_results: Dict[str, pd.DataFrame], top_n: int = 5):
     """Print best results for each timeframe"""
-    print("\n" + "="*100)
+    print("\n" + "="*110)
     print("BEST PARAMETERS PER TIMEFRAME")
-    print("="*100)
+    print("="*110)
 
     for tf, results_df in all_results.items():
         if results_df.empty:
             print(f"\n{tf}: No valid results")
             continue
 
-        print(f"\n{'-'*60}")
+        print(f"\n{'-'*70}")
         print(f"TIMEFRAME: {tf} (Top {top_n})")
-        print(f"{'-'*60}")
+        print(f"{'-'*70}")
 
         display_cols = [
-            'range_filter.sampling_period',
-            'range_filter.range_multiplier',
-            'risk.stop_loss_value',
-            'risk.take_profit_value',
-            'confirmation.min_bars_between_trades',
-            'return_pct', 'win_rate', 'profit_factor', 'sharpe', 'trades', 'score'
+            'sampling_period', 'range_multiplier', 'stop_loss_pct', 'take_profit_pct',
+            'return_pct', 'win_rate', 'profit_factor', 'sharpe_ratio',
+            'max_drawdown_pct', 'trades', 'score'
         ]
 
         top = results_df.head(top_n)[display_cols].copy()
-        top.columns = ['Period', 'Mult', 'SL%', 'TP%', 'MinBars',
-                       'Return', 'WinRate', 'PF', 'Sharpe', 'Trades', 'Score']
+        top.columns = ['Period', 'Mult', 'SL%', 'TP%',
+                       'Return', 'WinRate', 'PF', 'Sharpe', 'MaxDD', 'Trades', 'Score']
 
         # Format
         top['Return'] = top['Return'].apply(lambda x: f"{x:+.2f}%")
         top['WinRate'] = top['WinRate'].apply(lambda x: f"{x:.1f}%")
         top['PF'] = top['PF'].apply(lambda x: f"{x:.2f}")
         top['Sharpe'] = top['Sharpe'].apply(lambda x: f"{x:.2f}")
+        top['MaxDD'] = top['MaxDD'].apply(lambda x: f"{x:.2f}%")
         top['Score'] = top['Score'].apply(lambda x: f"{x:.2f}")
 
         print(top.to_string(index=False))
@@ -294,7 +338,6 @@ def print_overall_best(all_results: Dict[str, pd.DataFrame]):
         if not results_df.empty:
             for _, row in results_df.iterrows():
                 row_dict = row.to_dict()
-                row_dict['timeframe'] = tf
                 all_rows.append(row_dict)
 
     if not all_rows:
@@ -310,46 +353,66 @@ def print_overall_best(all_results: Dict[str, pd.DataFrame]):
     print("OVERALL BEST CONFIGURATION")
     print("="*70)
     print(f"\nTimeframe: {best['timeframe']}")
+    print(f"Data: {best['data_start']} to {best['data_end']} ({best['data_bars']} bars)")
     print(f"\nParameters:")
-    print(f"  Sampling Period:    {int(best['range_filter.sampling_period'])}")
-    print(f"  Range Multiplier:   {best['range_filter.range_multiplier']}")
-    print(f"  Stop Loss:          {best['risk.stop_loss_value']}%")
-    print(f"  Take Profit:        {best['risk.take_profit_value']}%")
-    print(f"  Min Bars Between:   {int(best['confirmation.min_bars_between_trades'])}")
+    print(f"  Sampling Period:    {int(best['sampling_period'])}")
+    print(f"  Range Multiplier:   {best['range_multiplier']}")
+    print(f"  Stop Loss:          {best['stop_loss_pct']}%")
+    print(f"  Take Profit:        {best['take_profit_pct']}%")
+    print(f"  Min Bars Between:   {int(best['min_bars_between'])}")
     print(f"\nPerformance:")
-    print(f"  Return:        {best['return_pct']:+.2f}%")
-    print(f"  Win Rate:      {best['win_rate']:.1f}%")
-    print(f"  Profit Factor: {best['profit_factor']:.2f}")
-    print(f"  Sharpe Ratio:  {best['sharpe']:.2f}")
-    print(f"  Max Drawdown:  {best['max_dd']:.2f}%")
-    print(f"  Trades:        {int(best['trades'])}")
-    print(f"  Score:         {best['score']:.2f}")
+    print(f"  Return:           {best['return_pct']:+.2f}%")
+    print(f"  Win Rate:         {best['win_rate']:.1f}%")
+    print(f"  Profit Factor:    {best['profit_factor']:.2f}")
+    print(f"  Sharpe Ratio:     {best['sharpe_ratio']:.2f}")
+    print(f"  Max Drawdown:     {best['max_drawdown_pct']:.2f}%")
+    print(f"  Trades:           {int(best['trades'])}")
+    print(f"  Max Concurrent:   {int(best['max_concurrent_pos'])}")
+    print(f"  Avg Bars Held:    {best['avg_bars_held']:.1f}")
+    print(f"  Expectancy:       {best['expectancy_r']:.3f}R")
+    print(f"  Score:            {best['score']:.2f}")
 
     # Save best config
+    run_id = best.get('run_id', datetime.now().strftime('%Y%m%d_%H%M%S'))
     best_config = {
+        'run_id': run_id,
         'timeframe': best['timeframe'],
+        'data_range': {
+            'start': best['data_start'],
+            'end': best['data_end'],
+            'bars': int(best['data_bars'])
+        },
         'parameters': {
-            'sampling_period': int(best['range_filter.sampling_period']),
-            'range_multiplier': float(best['range_filter.range_multiplier']),
-            'stop_loss_pct': float(best['risk.stop_loss_value']),
-            'take_profit_pct': float(best['risk.take_profit_value']),
-            'min_bars_between_trades': int(best['confirmation.min_bars_between_trades'])
+            'sampling_period': int(best['sampling_period']),
+            'range_multiplier': float(best['range_multiplier']),
+            'stop_loss_pct': float(best['stop_loss_pct']),
+            'take_profit_pct': float(best['take_profit_pct']),
+            'min_bars_between': int(best['min_bars_between'])
         },
         'performance': {
             'return_pct': float(best['return_pct']),
             'win_rate': float(best['win_rate']),
             'profit_factor': float(best['profit_factor']),
-            'sharpe': float(best['sharpe']),
-            'max_drawdown': float(best['max_dd']),
-            'trades': int(best['trades'])
-        }
+            'sharpe_ratio': float(best['sharpe_ratio']),
+            'max_drawdown_pct': float(best['max_drawdown_pct']),
+            'expectancy_r': float(best['expectancy_r']),
+            'trades': int(best['trades']),
+            'max_concurrent_pos': int(best['max_concurrent_pos']),
+            'avg_bars_held': float(best['avg_bars_held'])
+        },
+        'score': float(best['score'])
     }
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    with open(RESULTS_DIR / 'best_config.json', 'w') as f:
+    config_path = RESULTS_DIR / f'best_config_{run_id}.json'
+    with open(config_path, 'w') as f:
         json.dump(best_config, f, indent=2)
 
-    print(f"\nBest config saved to: {RESULTS_DIR / 'best_config.json'}")
+    # Also save as latest
+    with open(RESULTS_DIR / 'best_config_latest.json', 'w') as f:
+        json.dump(best_config, f, indent=2)
+
+    print(f"\nBest config saved to: {config_path}")
 
 
 def show_cached_data():
