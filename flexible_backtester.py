@@ -1,8 +1,10 @@
 """
 Flexible Backtester
 
-Properly tracks trades with their SL/TP levels.
-Supports multiple configurations and comparison.
+Each signal = independent trade with its own SL/TP.
+Trades close ONLY via SL or TP (signals don't close positions).
+Multiple trades can run simultaneously.
+Supports partial take profit (scale out).
 """
 
 import pandas as pd
@@ -27,16 +29,19 @@ from range_filter_strategy import apply_strategy, StrategyConfig as RFStrategyCo
 class TradeRecord:
     """Detailed trade record with all levels"""
     id: int
+    entry_bar: int  # Bar index when trade was opened
     entry_time: datetime
     entry_price: float
     direction: str  # 'long' or 'short'
-    size: float
+    initial_size: float  # Original size
+    current_size: float  # Remaining size after partial exits
     capital_at_entry: float
 
     # Levels calculated at entry
     stop_loss_price: float
     take_profit_price: float
-    trailing_stop_price: Optional[float] = None
+    partial_tp_price: float  # 50% of TP distance
+    partial_tp_hit: bool = False  # Has partial TP been triggered?
 
     # Signal info
     signal_strength: int = 0
@@ -50,8 +55,10 @@ class TradeRecord:
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
 
-    # P&L
-    gross_pnl: float = 0.0
+    # P&L tracking
+    partial_pnl: float = 0.0  # P&L from partial exit
+    final_pnl: float = 0.0    # P&L from final exit
+    total_pnl: float = 0.0    # Combined P&L
     spread_cost: float = 0.0
     net_pnl: float = 0.0
     pnl_pct: float = 0.0
@@ -60,29 +67,48 @@ class TradeRecord:
     # Duration
     bars_held: int = 0
 
-    def calculate_exit(self, exit_price: float, exit_time: datetime,
-                       exit_reason: str, spread_pct: float, bars: int):
-        """Calculate exit metrics"""
+    def calculate_partial_exit(self, exit_price: float, spread_pct: float):
+        """Calculate partial exit at 50% of position"""
+        partial_size = self.initial_size * 0.5
+
+        if self.direction == 'long':
+            self.partial_pnl = (exit_price - self.entry_price) * partial_size
+        else:
+            self.partial_pnl = (self.entry_price - exit_price) * partial_size
+
+        # Deduct spread for partial exit
+        self.spread_cost += (self.entry_price + exit_price) * partial_size * (spread_pct / 100)
+        self.current_size = self.initial_size - partial_size
+        self.partial_tp_hit = True
+
+    def calculate_final_exit(self, exit_price: float, exit_time: datetime,
+                             exit_reason: str, spread_pct: float, bars: int):
+        """Calculate final exit metrics"""
         self.exit_time = exit_time
         self.exit_price = exit_price
         self.exit_reason = exit_reason
         self.bars_held = bars
 
+        # Final P&L on remaining size
         if self.direction == 'long':
-            self.gross_pnl = (exit_price - self.entry_price) * self.size
+            self.final_pnl = (exit_price - self.entry_price) * self.current_size
             risk_per_unit = self.entry_price - self.stop_loss_price
         else:
-            self.gross_pnl = (self.entry_price - exit_price) * self.size
+            self.final_pnl = (self.entry_price - exit_price) * self.current_size
             risk_per_unit = self.stop_loss_price - self.entry_price
 
-        self.spread_cost = (self.entry_price + exit_price) * self.size * (spread_pct / 100)
-        self.net_pnl = self.gross_pnl - self.spread_cost
+        # Add spread for final exit
+        self.spread_cost += (self.entry_price + exit_price) * self.current_size * (spread_pct / 100)
 
-        trade_value = self.entry_price * self.size
+        # Total P&L
+        self.total_pnl = self.partial_pnl + self.final_pnl
+        self.net_pnl = self.total_pnl - self.spread_cost
+
+        trade_value = self.entry_price * self.initial_size
         self.pnl_pct = (self.net_pnl / trade_value) * 100 if trade_value > 0 else 0
 
-        # R-multiple: how many R did we make/lose
-        risk_amount = risk_per_unit * self.size
+        # R-multiple: how many R did we make/lose (based on initial risk)
+        risk_amount = risk_per_unit * self.initial_size
         self.r_multiple = self.net_pnl / risk_amount if risk_amount > 0 else 0
 
 
@@ -127,6 +153,10 @@ class BacktestResult:
     avg_bars_winner: float = 0.0
     avg_bars_loser: float = 0.0
 
+    # Position stats
+    max_concurrent_positions: int = 0
+    avg_concurrent_positions: float = 0.0
+
     # By exit reason
     exits_by_reason: Dict[str, int] = field(default_factory=dict)
 
@@ -136,7 +166,12 @@ class BacktestResult:
 
 class FlexibleBacktester:
     """
-    Flexible backtester with proper trade tracking
+    Flexible backtester with independent trade tracking.
+
+    - Each signal opens a new independent trade
+    - Trades close ONLY via SL or TP
+    - Multiple trades can run simultaneously
+    - Supports partial take profit (50% at 50% of target)
     """
 
     def __init__(self, config: StrategyConfig):
@@ -257,8 +292,8 @@ class FlexibleBacktester:
         direction: str,
         df: pd.DataFrame,
         idx: int
-    ) -> Tuple[float, float]:
-        """Calculate stop loss and take profit levels for a trade"""
+    ) -> Tuple[float, float, float]:
+        """Calculate stop loss, take profit, and partial TP levels"""
         risk = self.config.risk
 
         # Stop Loss
@@ -269,7 +304,6 @@ class FlexibleBacktester:
                 sl = entry_price * (1 + risk.stop_loss_value / 100)
 
         elif risk.stop_loss_type == 'atr':
-            # Calculate ATR
             atr = self._calculate_atr(df, idx)
             if direction == 'long':
                 sl = entry_price - (atr * risk.stop_loss_value)
@@ -290,7 +324,6 @@ class FlexibleBacktester:
                 tp = entry_price * (1 - risk.take_profit_value / 100)
 
         elif risk.take_profit_type == 'rr_ratio':
-            # TP based on risk/reward ratio
             risk_amount = abs(entry_price - sl)
             reward = risk_amount * risk.risk_reward_ratio
             if direction == 'long':
@@ -311,7 +344,13 @@ class FlexibleBacktester:
             else:
                 tp = entry_price - risk.take_profit_value
 
-        return sl, tp
+        # Partial TP at 50% of distance to full TP
+        if direction == 'long':
+            partial_tp = entry_price + (tp - entry_price) * 0.5
+        else:
+            partial_tp = entry_price - (entry_price - tp) * 0.5
+
+        return sl, tp, partial_tp
 
     def _calculate_atr(self, df: pd.DataFrame, idx: int, period: int = 14) -> float:
         """Calculate ATR at given index"""
@@ -331,7 +370,7 @@ class FlexibleBacktester:
         return tr.mean()
 
     def run(self, df: pd.DataFrame) -> BacktestResult:
-        """Run backtest"""
+        """Run backtest with independent trade tracking"""
         # Calculate indicators and signals
         data = self._calculate_indicators(df)
         data = self._generate_signals(data)
@@ -340,10 +379,10 @@ class FlexibleBacktester:
         result.initial_capital = self.config.initial_capital
 
         capital = self.config.initial_capital
-        position: Optional[TradeRecord] = None
-        trades: List[TradeRecord] = []
+        open_positions: List[TradeRecord] = []  # Multiple positions can be open
+        closed_trades: List[TradeRecord] = []
         equity = []
-        last_trade_bar = -999  # For min bars between trades
+        concurrent_positions = []
 
         for i in range(1, len(data)):
             current_time = data.index[i]
@@ -353,138 +392,164 @@ class FlexibleBacktester:
             low_price = data['low'].iloc[i]
             close_price = data['close'].iloc[i]
 
-            # Check exits if in position
-            if position is not None:
-                exit_triggered = False
-                exit_price = close_price
-                exit_reason = None
-                bars_held = current_bar - position.id  # Approximate
+            # Process all open positions
+            positions_to_close = []
+
+            for position in open_positions:
+                bars_held = current_bar - position.entry_bar
 
                 if position.direction == 'long':
-                    # Check stop loss (triggered at low)
+                    # Check partial TP first (if not already hit)
+                    if not position.partial_tp_hit and high_price >= position.partial_tp_price:
+                        position.calculate_partial_exit(
+                            position.partial_tp_price,
+                            self.config.spread_pct
+                        )
+                        capital += position.partial_pnl - (position.spread_cost / 2)
+
+                    # Check stop loss
                     if low_price <= position.stop_loss_price:
-                        exit_price = position.stop_loss_price
-                        exit_reason = 'stop_loss'
-                        exit_triggered = True
+                        position.calculate_final_exit(
+                            position.stop_loss_price, current_time, 'stop_loss',
+                            self.config.spread_pct, bars_held
+                        )
+                        positions_to_close.append(position)
+                        continue
 
-                    # Check take profit (triggered at high)
-                    if not exit_triggered and high_price >= position.take_profit_price:
-                        exit_price = position.take_profit_price
-                        exit_reason = 'take_profit'
-                        exit_triggered = True
-
-                    # Check signal reversal
-                    if not exit_triggered and data['combined_short'].iloc[i]:
-                        exit_reason = 'signal_reverse'
-                        exit_triggered = True
+                    # Check full take profit
+                    if high_price >= position.take_profit_price:
+                        position.calculate_final_exit(
+                            position.take_profit_price, current_time, 'take_profit',
+                            self.config.spread_pct, bars_held
+                        )
+                        positions_to_close.append(position)
+                        continue
 
                 else:  # short
-                    # Check stop loss (triggered at high)
+                    # Check partial TP first (if not already hit)
+                    if not position.partial_tp_hit and low_price <= position.partial_tp_price:
+                        position.calculate_partial_exit(
+                            position.partial_tp_price,
+                            self.config.spread_pct
+                        )
+                        capital += position.partial_pnl - (position.spread_cost / 2)
+
+                    # Check stop loss
                     if high_price >= position.stop_loss_price:
-                        exit_price = position.stop_loss_price
-                        exit_reason = 'stop_loss'
-                        exit_triggered = True
+                        position.calculate_final_exit(
+                            position.stop_loss_price, current_time, 'stop_loss',
+                            self.config.spread_pct, bars_held
+                        )
+                        positions_to_close.append(position)
+                        continue
 
-                    # Check take profit (triggered at low)
-                    if not exit_triggered and low_price <= position.take_profit_price:
-                        exit_price = position.take_profit_price
-                        exit_reason = 'take_profit'
-                        exit_triggered = True
+                    # Check full take profit
+                    if low_price <= position.take_profit_price:
+                        position.calculate_final_exit(
+                            position.take_profit_price, current_time, 'take_profit',
+                            self.config.spread_pct, bars_held
+                        )
+                        positions_to_close.append(position)
+                        continue
 
-                    # Check signal reversal
-                    if not exit_triggered and data['combined_long'].iloc[i]:
-                        exit_reason = 'signal_reverse'
-                        exit_triggered = True
-
-                if exit_triggered:
-                    position.calculate_exit(
-                        exit_price, current_time, exit_reason,
-                        self.config.spread_pct, bars_held
-                    )
-                    capital += position.net_pnl
-                    trades.append(position)
-                    last_trade_bar = current_bar
-                    position = None
-
-            # Check for new entry
-            if position is None:
-                # Respect min bars between trades
-                bars_since_last = current_bar - last_trade_bar
-                if bars_since_last < self.config.confirmation.min_bars_between_trades:
-                    pass  # Skip
-
-                elif data['combined_long'].iloc[i]:
-                    self.trade_counter += 1
-                    entry_price = close_price
-                    sl, tp = self._calculate_sl_tp(entry_price, 'long', data, i)
-
-                    risk_capital = capital * self.config.risk.position_size_pct
-                    size = risk_capital / entry_price
-
-                    position = TradeRecord(
-                        id=self.trade_counter,
-                        entry_time=current_time,
-                        entry_price=entry_price,
-                        direction='long',
-                        size=size,
-                        capital_at_entry=capital,
-                        stop_loss_price=sl,
-                        take_profit_price=tp,
-                        signal_strength=int(data['signal_strength'].iloc[i]),
-                        wolfpack_value=data['wolfpack'].iloc[i],
-                        wavetrend_value=data['wt1'].iloc[i],
-                        wolfpack_confirmed=data['wolfpack_long_confirm'].iloc[i],
-                        wavetrend_confirmed=data['wt_long_confirm'].iloc[i]
-                    )
-
-                elif data['combined_short'].iloc[i] and self.config.allow_shorting:
-                    self.trade_counter += 1
-                    entry_price = close_price
-                    sl, tp = self._calculate_sl_tp(entry_price, 'short', data, i)
-
-                    risk_capital = capital * self.config.risk.position_size_pct
-                    size = risk_capital / entry_price
-
-                    position = TradeRecord(
-                        id=self.trade_counter,
-                        entry_time=current_time,
-                        entry_price=entry_price,
-                        direction='short',
-                        size=size,
-                        capital_at_entry=capital,
-                        stop_loss_price=sl,
-                        take_profit_price=tp,
-                        signal_strength=int(data['signal_strength'].iloc[i]),
-                        wolfpack_value=data['wolfpack'].iloc[i],
-                        wavetrend_value=data['wt1'].iloc[i],
-                        wolfpack_confirmed=data['wolfpack_short_confirm'].iloc[i],
-                        wavetrend_confirmed=data['wt_short_confirm'].iloc[i]
-                    )
-
-            # Track equity
-            current_equity = capital
-            if position is not None:
-                if position.direction == 'long':
-                    unrealized = (close_price - position.entry_price) * position.size
+            # Close positions and update capital
+            for position in positions_to_close:
+                # Add final P&L (partial was already added)
+                if position.partial_tp_hit:
+                    capital += position.final_pnl - (position.spread_cost / 2)
                 else:
-                    unrealized = (position.entry_price - close_price) * position.size
-                current_equity = capital + unrealized
+                    capital += position.net_pnl
+                closed_trades.append(position)
+                open_positions.remove(position)
 
+            # Check for new entry signals
+            if data['combined_long'].iloc[i]:
+                self.trade_counter += 1
+                entry_price = close_price
+                sl, tp, partial_tp = self._calculate_sl_tp(entry_price, 'long', data, i)
+
+                risk_capital = capital * self.config.risk.position_size_pct
+                size = risk_capital / entry_price
+
+                position = TradeRecord(
+                    id=self.trade_counter,
+                    entry_bar=current_bar,
+                    entry_time=current_time,
+                    entry_price=entry_price,
+                    direction='long',
+                    initial_size=size,
+                    current_size=size,
+                    capital_at_entry=capital,
+                    stop_loss_price=sl,
+                    take_profit_price=tp,
+                    partial_tp_price=partial_tp,
+                    signal_strength=int(data['signal_strength'].iloc[i]),
+                    wolfpack_value=data['wolfpack'].iloc[i],
+                    wavetrend_value=data['wt1'].iloc[i],
+                    wolfpack_confirmed=data['wolfpack_long_confirm'].iloc[i],
+                    wavetrend_confirmed=data['wt_long_confirm'].iloc[i]
+                )
+                open_positions.append(position)
+
+            if data['combined_short'].iloc[i] and self.config.allow_shorting:
+                self.trade_counter += 1
+                entry_price = close_price
+                sl, tp, partial_tp = self._calculate_sl_tp(entry_price, 'short', data, i)
+
+                risk_capital = capital * self.config.risk.position_size_pct
+                size = risk_capital / entry_price
+
+                position = TradeRecord(
+                    id=self.trade_counter,
+                    entry_bar=current_bar,
+                    entry_time=current_time,
+                    entry_price=entry_price,
+                    direction='short',
+                    initial_size=size,
+                    current_size=size,
+                    capital_at_entry=capital,
+                    stop_loss_price=sl,
+                    take_profit_price=tp,
+                    partial_tp_price=partial_tp,
+                    signal_strength=int(data['signal_strength'].iloc[i]),
+                    wolfpack_value=data['wolfpack'].iloc[i],
+                    wavetrend_value=data['wt1'].iloc[i],
+                    wolfpack_confirmed=data['wolfpack_short_confirm'].iloc[i],
+                    wavetrend_confirmed=data['wt_short_confirm'].iloc[i]
+                )
+                open_positions.append(position)
+
+            # Track equity (capital + unrealized P&L)
+            unrealized = 0
+            for pos in open_positions:
+                if pos.direction == 'long':
+                    unrealized += (close_price - pos.entry_price) * pos.current_size
+                else:
+                    unrealized += (pos.entry_price - close_price) * pos.current_size
+
+            current_equity = capital + unrealized
             equity.append({'time': current_time, 'equity': current_equity})
+            concurrent_positions.append(len(open_positions))
 
-        # Close any remaining position
-        if position is not None:
-            position.calculate_exit(
+        # Close any remaining positions at end
+        for position in open_positions:
+            bars_held = len(data) - position.entry_bar
+            position.calculate_final_exit(
                 data['close'].iloc[-1], data.index[-1], 'end_of_data',
-                self.config.spread_pct, len(data) - position.id
+                self.config.spread_pct, bars_held
             )
-            capital += position.net_pnl
-            trades.append(position)
+            if position.partial_tp_hit:
+                capital += position.final_pnl - (position.spread_cost / 2)
+            else:
+                capital += position.net_pnl
+            closed_trades.append(position)
 
         # Calculate results
-        result.trades = trades
+        result.trades = closed_trades
         result.equity_curve = pd.DataFrame(equity).set_index('time')['equity'] if equity else pd.Series()
         result.final_capital = capital
+        result.max_concurrent_positions = max(concurrent_positions) if concurrent_positions else 0
+        result.avg_concurrent_positions = np.mean(concurrent_positions) if concurrent_positions else 0
         result = self._calculate_stats(result)
 
         return result
@@ -584,6 +649,10 @@ def print_detailed_results(result: BacktestResult):
     print(f"  Winners:     {result.winning_trades} ({result.win_rate:.1f}%)")
     print(f"  Losers:      {result.losing_trades}")
 
+    print(f"\n[POSITIONS]")
+    print(f"  Max Concurrent:  {result.max_concurrent_positions}")
+    print(f"  Avg Concurrent:  {result.avg_concurrent_positions:.1f}")
+
     print(f"\n[PROFIT/LOSS]")
     print(f"  Gross Profit:  ${result.gross_profit:,.2f}")
     print(f"  Gross Loss:    ${result.gross_loss:,.2f}")
@@ -624,22 +693,23 @@ def print_detailed_results(result: BacktestResult):
 
 def print_trade_details(trades: List[TradeRecord], limit: int = 20):
     """Print detailed trade log"""
-    print(f"\n{'='*120}")
+    print(f"\n{'='*130}")
     print(f"TRADE LOG (Last {min(limit, len(trades))} trades)")
-    print(f"{'='*120}")
+    print(f"{'='*130}")
     print(f"{'#':>4} {'Entry Time':<16} {'Dir':<5} {'Entry':>9} {'SL':>9} {'TP':>9} "
-          f"{'Exit':>9} {'P&L':>10} {'R':>6} {'Reason':<12}")
-    print("-"*120)
+          f"{'Partial':>9} {'Exit':>9} {'P&L':>10} {'R':>6} {'Reason':<12}")
+    print("-"*130)
 
     for trade in trades[-limit:]:
         entry_str = str(trade.entry_time)[:16]
         exit_price = trade.exit_price or 0
         r_str = f"{trade.r_multiple:+.2f}R"
         pnl_str = f"${trade.net_pnl:+.2f}"
+        partial_str = "Yes" if trade.partial_tp_hit else "No"
 
         print(f"{trade.id:>4} {entry_str:<16} {trade.direction:<5} "
               f"{trade.entry_price:>9.2f} {trade.stop_loss_price:>9.2f} "
-              f"{trade.take_profit_price:>9.2f} {exit_price:>9.2f} "
+              f"{trade.take_profit_price:>9.2f} {partial_str:>9} {exit_price:>9.2f} "
               f"{pnl_str:>10} {r_str:>6} {trade.exit_reason or '':<12}")
 
 
