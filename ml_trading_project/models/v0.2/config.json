@@ -1,0 +1,64 @@
+{
+  "version": "0.2",
+  "date": "2026-01-21",
+  "features": [
+    "wt1", "wt2", "wolfpack", "rsi", "atr_pct",
+    "price_vs_ma20", "price_vs_ma50", "ret_1h", "ret_4h", "ret_24h",
+    "bb_pct", "bb_width", "roc_5", "roc_10", "macd_hist", "stoch_rsi",
+    "hour", "is_overlap", "trend_score", "wt_distance", "volatility"
+  ],
+  "lookahead_hours": 24,
+  "target_pct": 0.5,
+  "backtest_period": "2025-12-16 to 2026-01-16",
+
+  "pure_model": {
+    "recommended_threshold": 0.8,
+    "performance": {
+      "trades": 62,
+      "win_rate": 62.9,
+      "total_return": 41.79,
+      "sharpe": 7.60
+    },
+    "params": {
+      "subsample": 0.7,
+      "n_estimators": 300,
+      "min_child_weight": 3,
+      "max_depth": 10,
+      "learning_rate": 0.2,
+      "gamma": 0.1,
+      "colsample_bytree": 0.9
+    }
+  },
+
+  "guided_model": {
+    "recommended_threshold": 0.8,
+    "performance": {
+      "trades": 8,
+      "win_rate": 87.5,
+      "total_return": 8.50,
+      "sharpe": 12.21
+    },
+    "params": {
+      "subsample": 0.8,
+      "n_estimators": 200,
+      "min_child_weight": 3,
+      "max_depth": 3,
+      "learning_rate": 0.2,
+      "gamma": 0.1,
+      "colsample_bytree": 0.7
+    }
+  },
+
+  "ensemble": {
+    "guided_threshold": 0.3,
+    "pure_threshold": 0.5,
+    "performance": {
+      "trades": 34,
+      "win_rate": 85.3,
+      "total_return": 28.04,
+      "sharpe": 11.51
+    }
+  },
+
+  "best_model": "ensemble (G=0.3, P=0.5)"
+}

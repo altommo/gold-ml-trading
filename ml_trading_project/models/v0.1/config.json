@@ -1,0 +1,43 @@
+{
+  "version": "0.1",
+  "status": "COMPLETE",
+  "date": "2026-01-21",
+
+  "features": [
+    "wt1", "wt2", "wolfpack", "rsi", "atr_pct",
+    "price_vs_ma20", "price_vs_ma50", "ret_1h", "ret_4h", "ret_24h"
+  ],
+  "lookahead_hours": 24,
+  "target_pct": 0.5,
+  "backtest_period": "2025-12-16 to 2026-01-16",
+  "train_test_split": "random (80/20)",
+
+  "pure_model": {
+    "threshold": 0.5,
+    "performance": {
+      "trades": 111,
+      "win_rate": 91.0,
+      "avg_return": 1.13,
+      "total_return": 125.08,
+      "sharpe": 17.19
+    },
+    "params": {
+      "n_estimators": 100,
+      "max_depth": 5,
+      "learning_rate": 0.1
+    }
+  },
+
+  "guided_model": {
+    "threshold": 0.3,
+    "performance": {
+      "trades": 128,
+      "win_rate": 57.8,
+      "avg_return": 0.29,
+      "total_return": 33.39,
+      "sharpe": 4.51
+    }
+  },
+
+  "best_model": "pure_model @ threshold 0.5 (125% return, 91% win rate)"
+}
